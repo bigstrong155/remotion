@@ -1,0 +1,89 @@
+# Place in .github/workflows/ on the default branch; start from Actions > Run workflow.
+name: Build Remotion runtime
+
+'on': workflow_dispatch
+permissions: {}
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      REMOTION_VERSION: '4.0.545'
+      REACT_VERSION: '19.3.1'
+    steps:
+      - name: Use Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install the Linux runtime in an empty directory
+        run: |
+          set -euo pipefail
+          test "$(node -p 'process.platform + "/" + process.arch')" = linux/x64
+          mkdir "$RUNNER_TEMP/remotion-linux-x64"
+          cd "$RUNNER_TEMP/remotion-linux-x64"
+          npm init -y >/dev/null
+          npm install --save-exact --include=optional --no-audit --no-fund \
+            "remotion@$REMOTION_VERSION" "@remotion/cli@$REMOTION_VERSION" \
+            "react@$REACT_VERSION" "react-dom@$REACT_VERSION"
+          ./node_modules/.bin/remotion browser ensure
+          test -s node_modules/.remotion/chrome-headless-shell/VERSION
+
+      - name: Add a self-contained one-second test composition
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/remotion-linux-x64"
+          cat > smoke.jsx <<'JSX'
+          import React from 'react';
+          import {AbsoluteFill, Composition, registerRoot, useCurrentFrame} from 'remotion';
+
+          const TestClip = () => {
+            const frame = useCurrentFrame();
+            return (
+              <AbsoluteFill style={{backgroundColor: '#18343a', justifyContent: 'center'}}>
+                <div style={{height: 12, width: 12 + frame * 12, backgroundColor: '#b2ed71'}} />
+              </AbsoluteFill>
+            );
+          };
+
+          const Root = () => (
+            <Composition id="Smoke" component={TestClip} durationInFrames={24}
+              fps={24} width={320} height={180} />
+          );
+          registerRoot(Root);
+          JSX
+
+      - name: Pack, unpack, and test the portable copy
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          mkdir deliverables restored
+          tar -czf deliverables/remotion-linux-x64.tgz remotion-linux-x64
+          tar -xzf deliverables/remotion-linux-x64.tgz -C restored
+          cd restored/remotion-linux-x64
+          # Fail rather than fetch a browser if the archived copy is incomplete.
+          browser=$(find node_modules/.remotion/chrome-headless-shell -type f \
+            \( -name headless_shell -o -name chrome-headless-shell \) -print -quit)
+          test -n "$browser" && test -x "$browser"
+          ./node_modules/.bin/remotion render smoke.jsx Smoke "$RUNNER_TEMP/smoke.mp4" \
+            --browser-executable="$PWD/$browser" --codec=h264 \
+            --concurrency=1 --hardware-acceleration=disable
+          test -s "$RUNNER_TEMP/smoke.mp4"
+          cd "$RUNNER_TEMP/deliverables"
+          sha256sum remotion-linux-x64.tgz | tee SHA256SUMS
+          sha256sum -c SHA256SUMS
+          printf 'Runtime checksum: `%s`\n' "$(cut -d' ' -f1 SHA256SUMS)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish runtime and checksum only
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: remotion-runtime-linux-x64
+          path: ${{ runner.temp }}/deliverables/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
